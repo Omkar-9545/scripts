@@ -1,11 +1,12 @@
-// AXI4 Master FSM with INCR/WRAP support and outstanding write/read control
+// AXI4 Master FSM with INCR/WRAP support and outstanding write/read control and retry logic
 
 module axi4_master_fsm #(
     parameter ADDR_WIDTH = 32,
-    parameter DATA_WIDTH = 128,
+    parameter DATA_WIDTH = 64,
     parameter BURST_LEN  = 8,
     parameter MAX_OUTSTANDING_W = 4,
-    parameter MAX_OUTSTANDING_R = 4
+    parameter MAX_OUTSTANDING_R = 4,
+    parameter RETRY_LIMIT = 3
 )(
     input  wire                     clk,
     input  wire                     rst_n,
@@ -33,6 +34,7 @@ module axi4_master_fsm #(
     // AXI Write Response Channel
     input  wire                    bvalid,
     output reg                     bready,
+    input  wire [1:0]              bresp,
 
     // AXI Read Address Channel
     output reg                     arvalid,
@@ -46,7 +48,8 @@ module axi4_master_fsm #(
     input  wire                    rvalid,
     output reg                     rready,
     input  wire [DATA_WIDTH-1:0]   rdata,
-    input  wire                    rlast
+    input  wire                    rlast,
+    input  wire [1:0]              rresp
 );
 
     typedef enum logic [2:0] {
@@ -60,14 +63,13 @@ module axi4_master_fsm #(
 
     state_t state, next_state;
 
-    // Outstanding transaction counters
     reg [$clog2(MAX_OUTSTANDING_W+1)-1:0] w_outstanding;
     reg [$clog2(MAX_OUTSTANDING_R+1)-1:0] r_outstanding;
-
-    // Burst tracking
     reg [7:0] burst_cnt;
 
-    // Wrap alignment logic
+    reg [1:0] write_retry_count;
+    reg [1:0] read_retry_count;
+
     localparam integer BEAT_SIZE_BYTES = DATA_WIDTH / 8;
     localparam integer WRAP_BOUNDARY   = BURST_LEN * BEAT_SIZE_BYTES;
     localparam [ADDR_WIDTH-1:0] WRAP_ADDR_MASK = ~(WRAP_BOUNDARY - 1);
@@ -97,16 +99,24 @@ module axi4_master_fsm #(
                     next_state = WRITE_RESP;
             end
             WRITE_RESP: begin
-                if (bvalid)
-                    next_state = IDLE;
+                if (bvalid) begin
+                    if (bresp != 2'b00 && write_retry_count < RETRY_LIMIT)
+                        next_state = WRITE_ADDR;
+                    else
+                        next_state = IDLE;
+                end
             end
             READ_ADDR: begin
                 if (arready && r_outstanding < MAX_OUTSTANDING_R)
                     next_state = READ_DATA;
             end
             READ_DATA: begin
-                if (rvalid && rlast)
-                    next_state = IDLE;
+                if (rvalid && rlast) begin
+                    if (rresp != 2'b00 && read_retry_count < RETRY_LIMIT)
+                        next_state = READ_ADDR;
+                    else
+                        next_state = IDLE;
+                end
             end
         endcase
     end
@@ -142,6 +152,28 @@ module axi4_master_fsm #(
             burst_cnt <= burst_cnt + 1;
         else if (state == IDLE)
             burst_cnt <= 0;
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            write_retry_count <= 0;
+        else if (state == WRITE_RESP && bvalid) begin
+            if (bresp != 2'b00 && write_retry_count < RETRY_LIMIT)
+                write_retry_count <= write_retry_count + 1;
+            else if (bresp == 2'b00)
+                write_retry_count <= 0;
+        end
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            read_retry_count <= 0;
+        else if (state == READ_DATA && rvalid && rlast) begin
+            if (rresp != 2'b00 && read_retry_count < RETRY_LIMIT)
+                read_retry_count <= read_retry_count + 1;
+            else if (rresp == 2'b00)
+                read_retry_count <= 0;
+        end
     end
 
     always @(*) begin
