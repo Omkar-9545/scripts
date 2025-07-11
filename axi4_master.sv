@@ -1,21 +1,21 @@
-// AXI4 Master FSM with INCR/WRAP support and outstanding write/read control and retry logic
+// AXI4 Master FSM with INCR/WRAP support, outstanding transfer control, retry logic, and dynamic burst length
 
 module axi4_master_fsm #(
-    parameter ADDR_WIDTH = 32,
-    parameter DATA_WIDTH = 64,
-    parameter BURST_LEN  = 8,
-    parameter MAX_OUTSTANDING_W = 4,
-    parameter MAX_OUTSTANDING_R = 4,
-    parameter RETRY_LIMIT = 3
+    parameter ADDR_WIDTH = 32,            // Width of AXI address
+    parameter DATA_WIDTH = 64,            // Width of AXI data (MIG typically supports 64 bits)
+    parameter MAX_OUTSTANDING_W = 4,      // Max number of write transactions before waiting for BRESP
+    parameter MAX_OUTSTANDING_R = 4,      // Max number of read transactions before waiting for read completion
+    parameter RETRY_LIMIT = 3             // Max retries for failed transactions (BRESP/RRESP != OKAY)
 )(
     input  wire                     clk,
     input  wire                     rst_n,
 
-    // Control
-    input  wire                     start,
-    input  wire [ADDR_WIDTH-1:0]   addr,
-    input  wire [1:0]              burst_type, // 2'b01: INCR, 2'b10: WRAP
-    input  wire                    rw,         // 1: Read, 0: Write
+    // Control interface
+    input  wire                     start,         // Signal to initiate transaction
+    input  wire [ADDR_WIDTH-1:0]   addr,          // Starting address
+    input  wire [1:0]              burst_type,    // 2'b01 = INCR, 2'b10 = WRAP
+    input  wire [7:0]              burst_len,     // Burst length in number of beats
+    input  wire                    rw,            // 1 = Read, 0 = Write
 
     // AXI Write Address Channel
     output reg                     awvalid,
@@ -52,6 +52,7 @@ module axi4_master_fsm #(
     input  wire [1:0]              rresp
 );
 
+    // FSM states
     typedef enum logic [2:0] {
         IDLE,
         WRITE_ADDR,
@@ -63,24 +64,33 @@ module axi4_master_fsm #(
 
     state_t state, next_state;
 
+    // Counters to track outstanding transactions
     reg [$clog2(MAX_OUTSTANDING_W+1)-1:0] w_outstanding;
     reg [$clog2(MAX_OUTSTANDING_R+1)-1:0] r_outstanding;
-    reg [7:0] burst_cnt;
 
+    // Retry counters for write/read errors
     reg [1:0] write_retry_count;
     reg [1:0] read_retry_count;
 
-    localparam integer BEAT_SIZE_BYTES = DATA_WIDTH / 8;
-    localparam integer WRAP_BOUNDARY   = BURST_LEN * BEAT_SIZE_BYTES;
-    localparam [ADDR_WIDTH-1:0] WRAP_ADDR_MASK = ~(WRAP_BOUNDARY - 1);
+    // Counter to track number of beats completed in current burst
+    reg [7:0] burst_cnt;
 
-    wire [ADDR_WIDTH-1:0] aligned_wrap_addr = addr & WRAP_ADDR_MASK;
+    // Derived constant: bytes per beat
+    localparam BEAT_SIZE_BYTES = DATA_WIDTH / 8;
 
+    // Calculate wrap boundary mask for aligned addressing in WRAP burst
+    wire [ADDR_WIDTH-1:0] wrap_mask = ~(burst_len * BEAT_SIZE_BYTES - 1);
+    wire [ADDR_WIDTH-1:0] aligned_wrap_addr = addr & wrap_mask;
+
+    // FSM state transition logic
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) state <= IDLE;
-        else state <= next_state;
+        if (!rst_n)
+            state <= IDLE;
+        else
+            state <= next_state;
     end
 
+    // FSM next-state logic
     always @(*) begin
         next_state = state;
         case (state)
@@ -88,30 +98,37 @@ module axi4_master_fsm #(
                 if (start)
                     next_state = rw ? READ_ADDR : WRITE_ADDR;
             end
+
             WRITE_ADDR: begin
+                // Proceed only if slave is ready and we haven't exceeded write queue limit
                 if (awready && w_outstanding < MAX_OUTSTANDING_W)
                     next_state = WRITE_DATA;
-                else if (w_outstanding >= MAX_OUTSTANDING_W)
-                    next_state = WRITE_RESP;
             end
+
             WRITE_DATA: begin
                 if (wvalid && wready && wlast)
                     next_state = WRITE_RESP;
             end
+
             WRITE_RESP: begin
                 if (bvalid) begin
+                    // Retry logic for write errors
                     if (bresp != 2'b00 && write_retry_count < RETRY_LIMIT)
                         next_state = WRITE_ADDR;
                     else
                         next_state = IDLE;
                 end
             end
+
             READ_ADDR: begin
+                // Proceed only if slave is ready and we haven't exceeded read queue limit
                 if (arready && r_outstanding < MAX_OUTSTANDING_R)
                     next_state = READ_DATA;
             end
+
             READ_DATA: begin
-                if (rvalid && rlast) begin
+                if (rvalid && rready && rlast) begin
+                    // Retry logic for read errors
                     if (rresp != 2'b00 && read_retry_count < RETRY_LIMIT)
                         next_state = READ_ADDR;
                     else
@@ -121,6 +138,18 @@ module axi4_master_fsm #(
         endcase
     end
 
+    // Track number of beats completed for burst
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            burst_cnt <= 0;
+        else if ((state == WRITE_DATA && wvalid && wready) || 
+                 (state == READ_DATA  && rvalid && rready))
+            burst_cnt <= burst_cnt + 1;
+        else if (state == IDLE)
+            burst_cnt <= 0;
+    end
+
+    // Write outstanding counter update
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             w_outstanding <= 0;
@@ -132,6 +161,7 @@ module axi4_master_fsm #(
         end
     end
 
+    // Read outstanding counter update
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             r_outstanding <= 0;
@@ -143,60 +173,54 @@ module axi4_master_fsm #(
         end
     end
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            burst_cnt <= 0;
-        else if ((state == WRITE_DATA) && (wvalid && wready))
-            burst_cnt <= burst_cnt + 1;
-        else if ((state == READ_DATA) && (rvalid && rready))
-            burst_cnt <= burst_cnt + 1;
-        else if (state == IDLE)
-            burst_cnt <= 0;
-    end
-
+    // Write retry counter
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             write_retry_count <= 0;
         else if (state == WRITE_RESP && bvalid) begin
             if (bresp != 2'b00 && write_retry_count < RETRY_LIMIT)
                 write_retry_count <= write_retry_count + 1;
-            else if (bresp == 2'b00)
+            else
                 write_retry_count <= 0;
         end
     end
 
+    // Read retry counter
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             read_retry_count <= 0;
-        else if (state == READ_DATA && rvalid && rlast) begin
+        else if (state == READ_DATA && rvalid && rready && rlast) begin
             if (rresp != 2'b00 && read_retry_count < RETRY_LIMIT)
                 read_retry_count <= read_retry_count + 1;
-            else if (rresp == 2'b00)
+            else
                 read_retry_count <= 0;
         end
     end
 
+    // Control signal generation
     always @(*) begin
+        // Default values
         awvalid = 0;
         awaddr  = (burst_type == 2'b10) ? aligned_wrap_addr : addr;
-        awlen   = BURST_LEN - 1;
+        awlen   = burst_len - 1;
         awsize  = $clog2(DATA_WIDTH / 8);
         awburst = burst_type;
 
-        wvalid = 0;
-        wdata  = {DATA_WIDTH{1'b1}};
-        wlast  = (burst_cnt == BURST_LEN - 1);
+        wvalid  = 0;
+        wdata   = {DATA_WIDTH{1'b1}}; // Dummy pattern
+        wlast   = (burst_cnt == burst_len - 1);
 
-        bready = 1;
+        bready  = 1;
 
         arvalid = 0;
         araddr  = (burst_type == 2'b10) ? aligned_wrap_addr : addr;
-        arlen   = BURST_LEN - 1;
+        arlen   = burst_len - 1;
         arsize  = $clog2(DATA_WIDTH / 8);
         arburst = burst_type;
 
         rready  = 1;
 
+        // Enable signals only in correct states
         case (state)
             WRITE_ADDR: awvalid = (w_outstanding < MAX_OUTSTANDING_W);
             WRITE_DATA: wvalid  = 1;
