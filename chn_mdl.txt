@@ -161,3 +161,56 @@ module stream_controller (
 
   assign stream_out = stream_reg;
 endmodule
+
+// 7. Top-Level Module for Channel Model
+module channel_model_top (
+  input logic clk,
+  input logic rst,
+  input logic start,
+  input logic flush,
+  input logic reset_sticky,
+  input logic [15:0] bram_data,
+  input logic signed [15:0] coeff [0:31],
+  output logic [15:0] final_output,
+  output logic sticky_flag
+);
+  // Intermediate wires
+  logic [15:0] stream;
+  logic [15:0] taps0 [0:31], taps1 [0:31], taps2 [0:31];
+  logic signed [35:0] y0, y1, y2;
+  logic signed [35:0] f0_out, f1_out, f2_out;
+  logic signed [39:0] sum;
+
+  // Instantiate stream controller
+  stream_controller stream_ctrl (
+    .clk(clk), .rst(rst), .bram_data(bram_data), .start(start), .flush(flush),
+    .stream_out(stream), .valid()
+  );
+
+  // First delay chain and filter
+  delay_chain dc0 (.clk(clk), .rst(rst), .flush(flush), .data_in(stream), .taps(taps0));
+  fir32_q15 f0 (.clk(clk), .rst(rst), .x(taps0), .coeff(coeff), .y(y0));
+
+  // FIFO0
+  fifo_q630 fifo0 (.clk(clk), .rst(rst), .wr_en(1), .rd_en(1), .din(y0), .dout(f0_out), .full(), .empty());
+
+  // Second delay chain and filter
+  delay_chain dc1 (.clk(clk), .rst(rst), .flush(flush), .data_in(stream), .taps(taps1));
+  fir32_q15 f1 (.clk(clk), .rst(rst), .x(taps1), .coeff(coeff), .y(y1));
+
+  fifo_q630 fifo1 (.clk(clk), .rst(rst), .wr_en(1), .rd_en(1), .din(y1), .dout(f1_out), .full(), .empty());
+
+  // Third delay chain and filter
+  delay_chain dc2 (.clk(clk), .rst(rst), .flush(flush), .data_in(stream), .taps(taps2));
+  fir32_q15 f2 (.clk(clk), .rst(rst), .x(taps2), .coeff(coeff), .y(y2));
+
+  fifo_q630 fifo2 (.clk(clk), .rst(rst), .wr_en(1), .rd_en(1), .din(y2), .dout(f2_out), .full(), .empty());
+
+  // Adder tree and converter
+  adder_tree3 adder (.in0(f0_out), .in1(f1_out), .in2(f2_out), .out(sum));
+
+  precision_converter conv (
+    .clk(clk), .rst(rst), .in(sum), .out(final_output),
+    .overflow_sticky(sticky_flag), .reset_sticky(reset_sticky)
+  );
+endmodule

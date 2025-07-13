@@ -1,0 +1,80 @@
+// Testbench for channel_model_top
+`timescale 1ns/1ps
+module channel_model_tb;
+  logic clk, rst, start, flush, reset_sticky;
+  logic [15:0] bram_data;
+  logic signed [15:0] coeff [0:31];
+  logic [15:0] final_output;
+  logic sticky_flag;
+
+  // Instantiate DUT
+  channel_model_top dut (
+    .clk(clk),
+    .rst(rst),
+    .start(start),
+    .flush(flush),
+    .reset_sticky(reset_sticky),
+    .bram_data(bram_data),
+    .coeff(coeff),
+    .final_output(final_output),
+    .sticky_flag(sticky_flag)
+  );
+
+  // Clock generation
+  initial clk = 0;
+  always #5 clk = ~clk; // 100 MHz clock
+
+  // Load input data from file
+  int infile;
+  int status;
+  int sample;
+  logic [15:0] bram_mem [0:2047];
+
+  initial begin
+    $display("Reading input data from input_data.txt...");
+    infile = $fopen("input_data.txt", "r");
+    if (!infile) begin
+      $fatal("Failed to open input_data.txt");
+    end
+    int i = 0;
+    while (!$feof(infile)) begin
+      status = $fscanf(infile, "%d\n", sample);
+      bram_mem[i] = sample[15:0];
+      i++;
+    end
+    $fclose(infile);
+  end
+
+  // Initialize filter coefficients to a simple low-pass set
+  initial begin
+    for (int i = 0; i < 32; i++)
+      coeff[i] = 16'sd512; // Example: All taps 1/64 ~= 0.0156
+  end
+
+  // Stimulus
+  int idx = 0;
+  initial begin
+    rst = 1;
+    flush = 0;
+    reset_sticky = 0;
+    start = 0;
+    #20 rst = 0;
+
+    repeat (10) @(posedge clk);
+    start = 1;
+    for (idx = 0; idx < 1024; idx++) begin
+      bram_data = bram_mem[idx];
+      @(posedge clk);
+    end
+    start = 0;
+
+    // Flush remaining pipeline
+    flush = 1;
+    repeat (50) @(posedge clk);
+    flush = 0;
+
+    // Dump final output
+    $display("Final Output: %0d, Sticky Overflow: %b", final_output, sticky_flag);
+    $finish;
+  end
+endmodule

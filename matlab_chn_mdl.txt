@@ -1,0 +1,93 @@
+% === Fixed-Point FIR Channel Model ===
+clear; clc;
+
+%% === Load Q1.15 Input Data (int16 format) ===
+x_raw = int16(load('input_data.txt'));   % Input in Q1.15
+N = length(x_raw);
+
+%% === Define Q1.15 coefficients ===
+h_raw = int16(512 * ones(1, 32)); % 512 = 0.015625 in Q1.15
+
+%% === Convert to fi objects (Q1.15) ===
+x = fi(x_raw, true, 16, 15);
+h = fi(h_raw, true, 16, 15);
+
+% Set fimath for Q1.15 * Q1.15 → Q2.30 accumulation
+F = fimath( ...
+  'RoundingMethod', 'Floor', ...
+  'OverflowAction', 'Wrap', ...
+  'ProductMode', 'SpecifyPrecision', ...
+  'ProductWordLength', 32, ...
+  'ProductFractionLength', 30, ...
+  'SumMode', 'SpecifyPrecision', ...
+  'SumWordLength', 36, ...
+  'SumFractionLength', 30 ...
+);
+
+x.fimath = F;
+h.fimath = F;
+
+%% === Function to do 32-tap convolution ===
+function y = fir32_q15(x, h)
+  N = length(x);
+  taps = length(h);
+  ylen = N - taps + 1;
+  y = fi(zeros(1, ylen), true, 36, 30); % Q6.30
+  for i = 1:ylen
+    acc = fi(0, true, 36, 30);
+    for j = 1:taps
+      acc = acc + x(i + j - 1) * h(j); % Q2.30 -> Q6.30 sum
+    end
+    y(i) = acc;
+  end
+end
+
+%% === Compute Filter Outputs (3 identical branches) ===
+y0 = fir32_q15(x, h); % Q6.30
+y1 = fir32_q15(x, h);
+y2 = fir32_q15(x, h);
+
+%% === Simulate FIFO Delay (Example: 0, 1, 2 cycles delay) ===
+% You can adjust these based on your FIFO depth
+d0 = 2; d1 = 1; d2 = 0;
+len = min([length(y0)-d0, length(y1)-d1, length(y2)-d2]);
+
+a = y0((1+d0):(len+d0));
+b = y1((1+d1):(len+d1));
+c = y2((1+d2):(len+d2));
+
+%% === Add Q6.30 values → Q8.30 result ===
+sum830 = fi(a + b + c, true, 40, 30);
+
+%% === Final Conversion: Q8.30 → Q1.15 ===
+golden = zeros(1, len, 'int16');
+sticky = false;
+
+for i = 1:len
+    % 1. Shift left 3 (to Q8.33), then round (add 2^(3-1) = 4)
+    val = int64(sum830(i).data);        % Q8.30 as int64
+    val_shifted = bitshift(val, 3);     % Q8.33
+    val_rounded = val_shifted + 4;      % rounding
+
+    % 2. Saturate to Q1.15 limits
+    MAX = int64(32767) * 2^18;  % Max representable in Q8.33
+    MIN = int64(-32768) * 2^18;
+
+    if val_rounded > MAX
+        golden(i) = int16(32767);
+        sticky = true;
+    elseif val_rounded < MIN
+        golden(i) = int16(-32768);
+        sticky = true;
+    else
+        golden(i) = int16(bitshift(val_rounded, -18)); % Truncate to Q1.15
+    end
+end
+
+%% === Save Golden Output ===
+fid = fopen('golden_output.txt', 'w');
+fprintf(fid, '%d\n', golden);
+fclose(fid);
+
+fprintf('Golden output saved to golden_output.txt\n');
+fprintf('Sticky Overflow Flag: %d\n', sticky);
