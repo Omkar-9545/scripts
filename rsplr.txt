@@ -1,0 +1,112 @@
+module resampler #(
+    parameter N = 9
+)(
+    input  wire                  clk,
+    input  wire                  rst,
+    input  wire signed [15:0]    stream_in,      // Q1.15
+    input  wire                  valid_in,
+    input  wire signed [15:0]    coeffs [N-1:0], // Q1.15
+
+    input  wire signed [31:0]    ppm_accum_in,   // Q1.31 accumulator
+    output reg  signed [15:0]    stream_out,     // Q1.15
+    output reg                   valid_out,
+
+    output reg                   sticky_mult,    // overflow in x*h
+    output reg                   sticky_accum,   // overflow in sum
+    output reg                   sticky_ppm,     // overflow in ppm * acc
+    output reg                   sticky_final    // overflow in final sum
+);
+
+    // ======================
+    // Stage 1: Delay chain
+    // ======================
+    reg signed [15:0] x [N-1:0];  // Q1.15 samples, x[0]=oldest, x[8]=newest
+
+    always_ff @(posedge clk) begin
+        if (valid_in) begin
+            for (int i = 0; i < N-1; i++) x[i] <= x[i+1];
+            x[N-1] <= stream_in;
+        end
+    end
+
+    // ======================
+    // Stage 2: Multiply (Q1.15 * Q1.15 = Q2.30 → truncate to Q1.30)
+    // ======================
+    wire signed [31:0] mult_full [N-1:0];  // Q2.30
+    wire signed [29:0] mult_trunc [N-1:0]; // Q1.30
+    wire overflow_mult [N-1:0];
+
+    genvar i;
+    generate
+        for (i = 0; i < N; i++) begin
+            assign mult_full[i]  = x[i] * coeffs[i];                // Q2.30
+            assign mult_trunc[i] = mult_full[i][29:0];              // Truncate MSB
+            assign overflow_mult[i] = mult_full[i][31] != mult_full[i][30]; // Check overflow
+        end
+    endgenerate
+
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) sticky_mult <= 0;
+        else sticky_mult <= sticky_mult | (|overflow_mult);
+    end
+
+    // ======================
+    // Stage 3: Accumulate all (Q1.30) → Q5.30
+    // ======================
+    reg signed [34:0] sum_530;  // Q5.30
+    always_comb begin
+        sum_530 = 0;
+        for (int j = 0; j < N; j++) sum_530 += {{5{mult_trunc[j][29]}}, mult_trunc[j]}; // sign-extend Q1.30 to Q5.30
+    end
+
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) sticky_accum <= 0;
+        else if (sum_530 > 34'sh07FFFFFFFF || sum_530 < -34'sh080000000)
+            sticky_accum <= 1;
+    end
+
+    // ======================
+    // Stage 4: Multiply with PPM accumulator (Q1.31)
+    // ======================
+    wire signed [65:0] ppm_prod = sum_530 * ppm_accum_in; // Q5.30 * Q1.31 = Q6.61
+    wire signed [16:0] ppm_scaled = ppm_prod[45:29];      // Convert to Q1.16
+
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) sticky_ppm <= 0;
+        else if (|ppm_prod[65:46] && ~&ppm_prod[65:46])  // Non-sign-extension bits
+            sticky_ppm <= 1;
+    end
+
+    // ======================
+    // Stage 5: Add center sample (Q1.15) + ppm_scaled (Q1.16 → shifted Q1.15)
+    // ======================
+    wire signed [16:0] ppm_scaled_sat;
+    assign ppm_scaled_sat = (ppm_scaled > 17'sh7FFF) ? 17'sh7FFF :
+                            (ppm_scaled < -17'sh8000) ? -17'sh8000 :
+                            ppm_scaled;
+
+    wire signed [15:0] center_sample = x[4];  // Center tap (odd filter)
+    wire signed [16:0] final_sum = center_sample + ppm_scaled_sat[15:0];
+
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) begin
+            stream_out     <= 0;
+            sticky_final   <= 0;
+            valid_out      <= 0;
+        end else begin
+            valid_out <= 1;
+
+            // Final saturation
+            if (final_sum > 17'sh7FFF) begin
+                stream_out   <= 16'sh7FFF;
+                sticky_final <= 1;
+            end else if (final_sum < -17'sh8000) begin
+                stream_out   <= -16'sh8000;
+                sticky_final <= 1;
+            end else begin
+                stream_out   <= final_sum[15:0];
+            end
+        end
+    end
+
+endmodule

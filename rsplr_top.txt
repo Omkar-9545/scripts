@@ -1,0 +1,110 @@
+module resampler_top #(
+    parameter DATA_WIDTH = 16,
+    parameter ADDR_WIDTH = 10  // Depth = 1024
+)(
+    input  wire                      clk,
+    input  wire                      rst,
+
+    // External input
+    input  wire                      in_valid,
+    input  wire signed [15:0]        in_sample,
+    input  wire signed [15:0]        coeffs [0:8],      // Q1.15
+    input  wire signed [31:0]        ppm_step,          // Q1.31
+
+    // Output
+    output wire                      out_valid,
+    output wire signed [15:0]        out_sample,
+    output wire                      sticky_mult,
+    output wire                      sticky_accum,
+    output wire                      sticky_ppm,
+    output wire                      sticky_final
+);
+
+    // ===================================================
+    // Internal FIFO: Input side
+    // ===================================================
+    wire signed [15:0] fifo_in_data;
+    wire fifo_in_full, fifo_in_empty;
+    wire fifo_in_wr_en = in_valid && !fifo_in_full;
+    wire fifo_in_rd_en;
+
+    fifo #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .ADDR_WIDTH(ADDR_WIDTH)
+    ) input_fifo (
+        .clk(clk), .rst(rst),
+        .wr_en(fifo_in_wr_en),
+        .rd_en(fifo_in_rd_en),
+        .din(in_sample),
+        .dout(fifo_in_data),
+        .full(fifo_in_full),
+        .empty(fifo_in_empty)
+    );
+
+    // ===================================================
+    // PPM Accumulator Logic: signed 32-bit Q1.31
+    // ===================================================
+    reg signed [31:0] ppm_accum;
+    reg               overflow_sign_bit;
+    wire              enable_sample;
+
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) begin
+            ppm_accum <= 0;
+            overflow_sign_bit <= 0;
+        end else begin
+            ppm_accum <= ppm_accum + ppm_step;
+
+            // Overflow detection using MSB sign toggle
+            overflow_sign_bit <= (ppm_accum[31] ^ (ppm_accum + ppm_step)[31]);
+        end
+    end
+
+    assign enable_sample = overflow_sign_bit;
+
+    assign fifo_in_rd_en = enable_sample && !fifo_in_empty;
+
+    // ===================================================
+    // Core Resampler Instantiation
+    // ===================================================
+    wire signed [15:0] stream_out_core;
+    wire               valid_out_core;
+
+    resampler core (
+        .clk(clk),
+        .rst(rst),
+        .stream_in(fifo_in_data),
+        .valid_in(fifo_in_rd_en),
+        .coeffs(coeffs),
+        .ppm_accum_in(ppm_accum),
+
+        .stream_out(stream_out_core),
+        .valid_out(valid_out_core),
+
+        .sticky_mult(sticky_mult),
+        .sticky_accum(sticky_accum),
+        .sticky_ppm(sticky_ppm),
+        .sticky_final(sticky_final)
+    );
+
+    // ===================================================
+    // Output FIFO: Optional
+    // ===================================================
+    wire fifo_out_full, fifo_out_empty;
+    wire fifo_out_wr_en = valid_out_core && !fifo_out_full;
+    assign out_valid = !fifo_out_empty;
+
+    fifo #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .ADDR_WIDTH(ADDR_WIDTH)
+    ) output_fifo (
+        .clk(clk), .rst(rst),
+        .wr_en(fifo_out_wr_en),
+        .rd_en(1'b0),  // controlled externally
+        .din(stream_out_core),
+        .dout(out_sample),
+        .full(fifo_out_full),
+        .empty(fifo_out_empty)
+    );
+
+endmodule
