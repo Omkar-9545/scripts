@@ -123,4 +123,13 @@ module tb_resampler_top;
 
         // Display sticky flags
         $display("Sticky Flags:");
-        $display("  Mult Overflow:  %b
+        $display("  Mult Overflow:  %b", sticky_mult);
+        $display("  Accum Overflow: %b", sticky_accum);
+        $display("  PPM  Overflow:  %b", sticky_ppm);
+        $display("  Final Overflow: %b", sticky_final);
+
+        $finish;
+    end
+
+endmodule
+
